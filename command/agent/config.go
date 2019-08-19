@@ -501,6 +501,9 @@ type Telemetry struct {
 	DataDogAddr              string        `hcl:"datadog_address"`
 	DataDogTags              []string      `hcl:"datadog_tags"`
 	PrometheusMetrics        bool          `hcl:"prometheus_metrics"`
+	PrometheusPushAddr       string        `hcl:"prometheus_push_address"`
+	PrometheusPushInterval   string        `hcl:"prometheus_push_interval"`
+	prometheusPushInterval   time.Duration `hcl:"-"`
 	DisableHostname          bool          `hcl:"disable_hostname"`
 	UseNodeName              bool          `hcl:"use_node_name"`
 	CollectionInterval       string        `hcl:"collection_interval"`
@@ -782,6 +785,8 @@ func DevConfig(mode *devModeConfig) *Config {
 		DisableSandbox:    false,
 	}
 	conf.Telemetry.PrometheusMetrics = true
+	conf.Telemetry.PrometheusPushAddr = ""
+	conf.Telemetry.PrometheusPushInterval = "5s"
 	conf.Telemetry.PublishAllocationMetrics = true
 	conf.Telemetry.PublishNodeMetrics = true
 
@@ -843,8 +848,10 @@ func DefaultConfig() *Config {
 		},
 		SyslogFacility: "LOCAL0",
 		Telemetry: &Telemetry{
-			CollectionInterval: "1s",
-			collectionInterval: 1 * time.Second,
+			PrometheusPushInterval: "10s",
+			prometheusPushInterval: 10 * time.Second,
+			CollectionInterval:     "1s",
+			collectionInterval:     1 * time.Second,
 		},
 		TLSConfig:          &config.TLSConfig{},
 		Sentinel:           &config.SentinelConfig{},
@@ -1468,6 +1475,16 @@ func (a *Telemetry) Merge(b *Telemetry) *Telemetry {
 	if b.PrometheusMetrics {
 		result.PrometheusMetrics = b.PrometheusMetrics
 	}
+	if b.PrometheusPushAddr != "" {
+		result.PrometheusPushAddr = b.PrometheusPushAddr
+	}
+	if b.PrometheusPushInterval != "" {
+		result.PrometheusPushInterval = b.PrometheusPushInterval
+	}
+	if b.prometheusPushInterval != 0 {
+		result.prometheusPushInterval = b.prometheusPushInterval
+	}
+
 	if b.DisableHostname {
 		result.DisableHostname = true
 	}

@@ -954,12 +954,21 @@ func (c *Command) setupTelemetry(config *Config) (*metrics.InmemSink, error) {
 	}
 
 	// Configure the prometheus sink
-	if telConfig.PrometheusMetrics {
+	if telConfig.PrometheusMetrics && telConfig.PrometheusPushAddr == "" {
 		promSink, err := prometheus.NewPrometheusSink()
 		if err != nil {
 			return inm, err
 		}
 		fanout = append(fanout, promSink)
+	}
+
+	// Configure the prometheus push sink
+	if telConfig.PrometheusPushAddr != "" {
+		sink, err := prometheus.NewPrometheusPushSink(telConfig.PrometheusPushAddr, telConfig.prometheusPushInterval)
+		if err != nil {
+			return inm, err
+		}
+		fanout = append(fanout, sink)
 	}
 
 	// Configure the datadog sink
