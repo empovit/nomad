@@ -2,7 +2,9 @@ package structs
 
 import (
 	"testing"
+	"time"
 
+	"github.com/hashicorp/nomad/helper"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,8 +34,11 @@ func TestConsulConnect_CopyEquals(t *testing.T) {
 
 	c := &ConsulConnect{
 		SidecarService: &ConsulSidecarService{
+			Tags: []string{"tag1", "tag2"},
 			Port: "9001",
 			Proxy: &ConsulProxy{
+				LocalServiceAddress: "127.0.0.1",
+				LocalServicePort:    8080,
 				Upstreams: []ConsulUpstream{
 					{
 						DestinationName: "up1",
@@ -59,4 +64,60 @@ func TestConsulConnect_CopyEquals(t *testing.T) {
 
 	o.SidecarService.Proxy.Upstreams = nil
 	require.False(t, c.Equals(o))
+}
+
+func TestSidecarTask_MergeIntoTask(t *testing.T) {
+
+	task := MockJob().TaskGroups[0].Tasks[0]
+	sTask := &SidecarTask{
+		Name:   "sidecar",
+		Driver: "sidecar",
+		User:   "test",
+		Config: map[string]interface{}{
+			"foo": "bar",
+		},
+		Resources: &Resources{
+			CPU:      10000,
+			MemoryMB: 10000,
+		},
+		Env: map[string]string{
+			"sidecar": "proxy",
+		},
+		Meta: map[string]string{
+			"abc": "123",
+		},
+		KillTimeout: helper.TimeToPtr(15 * time.Second),
+		LogConfig: &LogConfig{
+			MaxFiles: 3,
+		},
+		ShutdownDelay: helper.TimeToPtr(5 * time.Second),
+		KillSignal:    "SIGABRT",
+	}
+
+	expected := task.Copy()
+	expected.Name = "sidecar"
+	expected.Driver = "sidecar"
+	expected.User = "test"
+	expected.Config = map[string]interface{}{
+		"foo": "bar",
+	}
+	expected.Resources.CPU = 10000
+	expected.Resources.MemoryMB = 10000
+	expected.Env["sidecar"] = "proxy"
+	expected.Meta["abc"] = "123"
+	expected.KillTimeout = 15 * time.Second
+	expected.LogConfig.MaxFiles = 3
+	expected.ShutdownDelay = 5 * time.Second
+	expected.KillSignal = "SIGABRT"
+
+	sTask.MergeIntoTask(task)
+	require.Exactly(t, expected, task)
+
+	// Check that changing just driver config doesn't replace map
+	sTask.Config["abc"] = 123
+	expected.Config["abc"] = 123
+
+	sTask.MergeIntoTask(task)
+	require.Exactly(t, expected, task)
+
 }

@@ -872,10 +872,8 @@ func TestTaskGroup_Validate(t *testing.T) {
 	tg = &TaskGroup{
 		Volumes: map[string]*VolumeRequest{
 			"foo": {
-				Type: "nothost",
-				Config: map[string]interface{}{
-					"sOuRcE": "foo",
-				},
+				Type:   "nothost",
+				Source: "foo",
 			},
 		},
 		Tasks: []*Task{
@@ -937,6 +935,34 @@ func TestTaskGroup_Validate(t *testing.T) {
 
 	expected = `Task task-b has a volume mount (0) referencing undefined volume foob`
 	require.Contains(t, err.Error(), expected)
+
+	taskA := &Task{Name: "task-a"}
+	tg = &TaskGroup{
+		Name: "group-a",
+		Services: []*Service{
+			{
+				Name: "service-a",
+				Checks: []*ServiceCheck{
+					{
+						Name:      "check-a",
+						Type:      "tcp",
+						TaskName:  "task-b",
+						PortLabel: "http",
+						Interval:  time.Duration(1 * time.Second),
+						Timeout:   time.Duration(1 * time.Second),
+					},
+				},
+			},
+		},
+		Tasks: []*Task{taskA},
+	}
+	err = tg.Validate(&Job{})
+	expected = `Check check-a invalid: refers to non-existent task task-b`
+	require.Contains(t, err.Error(), expected)
+
+	expected = `Check check-a invalid: only script and gRPC checks should have tasks`
+	require.Contains(t, err.Error(), expected)
+
 }
 
 func TestTask_Validate(t *testing.T) {
@@ -1513,7 +1539,7 @@ func TestTask_Validate_Service_Check_CheckRestart(t *testing.T) {
 	assert.Nil(t, validCheckRestart.Validate())
 }
 
-func TestTask_Validate_ConnectKind(t *testing.T) {
+func TestTask_Validate_ConnectProxyKind(t *testing.T) {
 	ephemeralDisk := DefaultEphemeralDisk()
 	getTask := func(kind TaskKind, leader bool) *Task {
 		task := &Task{
@@ -1573,7 +1599,7 @@ func TestTask_Validate_ConnectKind(t *testing.T) {
 			Service: &Service{
 				Name: "redis",
 			},
-			ErrContains: "Connect proxy service kind \"connect-proxy:redis:test\" must not contain `:`",
+			ErrContains: "Connect proxy service name not found in services from task group",
 		},
 		{
 			Desc:        "Service name not found in group",
@@ -1967,7 +1993,7 @@ func TestAffinity_Validate(t *testing.T) {
 
 func TestUpdateStrategy_Validate(t *testing.T) {
 	u := &UpdateStrategy{
-		MaxParallel:      0,
+		MaxParallel:      -1,
 		HealthCheck:      "foo",
 		MinHealthyTime:   -10,
 		HealthyDeadline:  -15,
@@ -1981,7 +2007,7 @@ func TestUpdateStrategy_Validate(t *testing.T) {
 	if !strings.Contains(mErr.Errors[0].Error(), "Invalid health check given") {
 		t.Fatalf("err: %s", err)
 	}
-	if !strings.Contains(mErr.Errors[1].Error(), "Max parallel can not be less than one") {
+	if !strings.Contains(mErr.Errors[1].Error(), "Max parallel can not be less than zero") {
 		t.Fatalf("err: %s", err)
 	}
 	if !strings.Contains(mErr.Errors[2].Error(), "Canary count can not be less than zero") {
@@ -2345,6 +2371,22 @@ func TestInvalidServiceCheck(t *testing.T) {
 	if err := s.Validate(); err != nil {
 		t.Fatalf("un-expected error: %v", err)
 	}
+
+	s = Service{
+		Name: "service-name",
+		Checks: []*ServiceCheck{
+			{
+				Name:     "tcp-check",
+				Type:     ServiceCheckTCP,
+				Interval: 5 * time.Second,
+				Timeout:  2 * time.Second,
+			},
+		},
+		Connect: &ConsulConnect{
+			SidecarService: &ConsulSidecarService{},
+		},
+	}
+	require.Error(t, s.Validate())
 }
 
 func TestDistinctCheckID(t *testing.T) {

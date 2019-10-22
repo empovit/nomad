@@ -207,6 +207,13 @@ type QueryOptions struct {
 	Region string
 
 	// Namespace is the target namespace for the query.
+	//
+	// Since handlers do not have a default value set they should access
+	// the Namespace via the RequestNamespace method.
+	//
+	// Requests accessing specific namespaced objects must check ACLs
+	// against the namespace of the object, not the namespace in the
+	// request.
 	Namespace string
 
 	// If set, wait until query exceeds given index. Must be provided
@@ -233,6 +240,11 @@ func (q QueryOptions) RequestRegion() string {
 	return q.Region
 }
 
+// RequestNamespace returns the request's namespace or the default namespace if
+// no explicit namespace was sent.
+//
+// Requests accessing specific namespaced objects must check ACLs against the
+// namespace of the object, not the namespace in the request.
 func (q QueryOptions) RequestNamespace() string {
 	if q.Namespace == "" {
 		return DefaultNamespace
@@ -254,6 +266,13 @@ type WriteRequest struct {
 	Region string
 
 	// Namespace is the target namespace for the write.
+	//
+	// Since RPC handlers do not have a default value set they should
+	// access the Namespace via the RequestNamespace method.
+	//
+	// Requests accessing specific namespaced objects must check ACLs
+	// against the namespace of the object, not the namespace in the
+	// request.
 	Namespace string
 
 	// AuthToken is secret portion of the ACL token used for the request
@@ -267,6 +286,11 @@ func (w WriteRequest) RequestRegion() string {
 	return w.Region
 }
 
+// RequestNamespace returns the request's namespace or the default namespace if
+// no explicit namespace was sent.
+//
+// Requests accessing specific namespaced objects must check ACLs against the
+// namespace of the object, not the namespace in the request.
 func (w WriteRequest) RequestNamespace() string {
 	if w.Namespace == "" {
 		return DefaultNamespace
@@ -2151,6 +2175,24 @@ func (n *NetworkResource) PortLabels() map[string]int {
 	return labelValues
 }
 
+// ConnectPort returns the Connect port for the given service. Returns false if
+// no port was found for a service with that name.
+func (n *NetworkResource) PortForService(serviceName string) (Port, bool) {
+	label := fmt.Sprintf("%s-%s", ConnectProxyPrefix, serviceName)
+	for _, port := range n.ReservedPorts {
+		if port.Label == label {
+			return port, true
+		}
+	}
+	for _, port := range n.DynamicPorts {
+		if port.Label == label {
+			return port, true
+		}
+	}
+
+	return Port{}, false
+}
+
 // Networks defined for a task on the Resources struct.
 type Networks []*NetworkResource
 
@@ -3622,7 +3664,7 @@ func (j *Job) Stopped() bool {
 // HasUpdateStrategy returns if any task group in the job has an update strategy
 func (j *Job) HasUpdateStrategy() bool {
 	for _, tg := range j.TaskGroups {
-		if tg.Update != nil {
+		if !tg.Update.IsEmpty() {
 			return true
 		}
 	}
@@ -3951,8 +3993,8 @@ func (u *UpdateStrategy) Validate() error {
 		multierror.Append(&mErr, fmt.Errorf("Invalid health check given: %q", u.HealthCheck))
 	}
 
-	if u.MaxParallel < 1 {
-		multierror.Append(&mErr, fmt.Errorf("Max parallel can not be less than one: %d < 1", u.MaxParallel))
+	if u.MaxParallel < 0 {
+		multierror.Append(&mErr, fmt.Errorf("Max parallel can not be less than zero: %d < 0", u.MaxParallel))
 	}
 	if u.Canary < 0 {
 		multierror.Append(&mErr, fmt.Errorf("Canary count can not be less than zero: %d < 0", u.Canary))
@@ -3980,6 +4022,14 @@ func (u *UpdateStrategy) Validate() error {
 	}
 
 	return mErr.ErrorOrNil()
+}
+
+func (u *UpdateStrategy) IsEmpty() bool {
+	if u == nil {
+		return true
+	}
+
+	return u.MaxParallel == 0
 }
 
 // TODO(alexdadgar): Remove once no longer used by the scheduler.
@@ -4757,6 +4807,14 @@ func (tg *TaskGroup) Canonicalize(job *Job) {
 		tg.EphemeralDisk = DefaultEphemeralDisk()
 	}
 
+	for _, service := range tg.Services {
+		service.Canonicalize(job.Name, tg.Name, "group")
+	}
+
+	for _, network := range tg.Networks {
+		network.Canonicalize()
+	}
+
 	for _, task := range tg.Tasks {
 		task.Canonicalize(job, tg)
 	}
@@ -4891,13 +4949,7 @@ func (tg *TaskGroup) Validate(j *Job) error {
 			continue
 		}
 
-		cfg, err := ParseHostVolumeConfig(decl.Config)
-		if err != nil {
-			mErr.Errors = append(mErr.Errors, fmt.Errorf("Volume %s has unparseable config: %v", name, err))
-			continue
-		}
-
-		if cfg.Source == "" {
+		if decl.Source == "" {
 			mErr.Errors = append(mErr.Errors, fmt.Errorf("Volume %s has an empty source", name))
 		}
 	}
@@ -4905,6 +4957,12 @@ func (tg *TaskGroup) Validate(j *Job) error {
 	// Validate task group and task network resources
 	if err := tg.validateNetworks(); err != nil {
 		outer := fmt.Errorf("Task group network validation failed: %v", err)
+		mErr.Errors = append(mErr.Errors, outer)
+	}
+
+	// Validate task group and task services
+	if err := tg.validateServices(); err != nil {
+		outer := fmt.Errorf("Task group service validation failed: %v", err)
 		mErr.Errors = append(mErr.Errors, outer)
 	}
 
@@ -4993,6 +5051,62 @@ func (tg *TaskGroup) validateNetworks() error {
 					} else {
 						mappedPorts[port.To] = fmt.Sprintf("taskgroup network:%s", port.Label)
 					}
+				}
+			}
+		}
+	}
+	return mErr.ErrorOrNil()
+}
+
+// validateServices runs Service.Validate() on group-level services,
+// checks that group services do not conflict with task services and that
+// group service checks that refer to tasks only refer to tasks that exist.
+func (tg *TaskGroup) validateServices() error {
+	var mErr multierror.Error
+	knownTasks := make(map[string]struct{})
+	knownServices := make(map[string]struct{})
+
+	// Create a map of known tasks and their services so we can compare
+	// vs the group-level services and checks
+	for _, task := range tg.Tasks {
+		knownTasks[task.Name] = struct{}{}
+		if task.Services == nil {
+			continue
+		}
+		for _, service := range task.Services {
+			if _, ok := knownServices[service.Name+service.PortLabel]; ok {
+				mErr.Errors = append(mErr.Errors, fmt.Errorf("Service %s is duplicate", service.Name))
+			}
+			for _, check := range service.Checks {
+				if check.TaskName != "" {
+					mErr.Errors = append(mErr.Errors, fmt.Errorf("Check %s is invalid: only task group service checks can be assigned tasks", check.Name))
+				}
+			}
+			knownServices[service.Name+service.PortLabel] = struct{}{}
+		}
+	}
+	for i, service := range tg.Services {
+		if err := service.Validate(); err != nil {
+			outer := fmt.Errorf("Service[%d] %s validation failed: %s", i, service.Name, err)
+			mErr.Errors = append(mErr.Errors, outer)
+			// we break here to avoid the risk of crashing on null-pointer
+			// access in a later step, accepting that we might miss out on
+			// error messages to provide the user.
+			continue
+		}
+		if _, ok := knownServices[service.Name+service.PortLabel]; ok {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("Service %s is duplicate", service.Name))
+		}
+		knownServices[service.Name+service.PortLabel] = struct{}{}
+		for _, check := range service.Checks {
+			if check.TaskName != "" {
+				if check.Type != ServiceCheckScript && check.Type != ServiceCheckGRPC {
+					mErr.Errors = append(mErr.Errors,
+						fmt.Errorf("Check %s invalid: only script and gRPC checks should have tasks", check.Name))
+				}
+				if _, ok := knownTasks[check.TaskName]; !ok {
+					mErr.Errors = append(mErr.Errors,
+						fmt.Errorf("Check %s invalid: refers to non-existent task %s", check.Name, check.TaskName))
 				}
 			}
 		}
@@ -5104,6 +5218,16 @@ const (
 type LogConfig struct {
 	MaxFiles      int
 	MaxFileSizeMB int
+}
+
+func (l *LogConfig) Copy() *LogConfig {
+	if l == nil {
+		return nil
+	}
+	return &LogConfig{
+		MaxFiles:      l.MaxFiles,
+		MaxFileSizeMB: l.MaxFileSizeMB,
+	}
 }
 
 // DefaultLogConfig returns the default LogConfig values.
@@ -5229,6 +5353,7 @@ func (t *Task) Copy() *Task {
 
 	nt.Vault = nt.Vault.Copy()
 	nt.Resources = nt.Resources.Copy()
+	nt.LogConfig = nt.LogConfig.Copy()
 	nt.Meta = helper.CopyMapStringString(nt.Meta)
 	nt.DispatchPayload = nt.DispatchPayload.Copy()
 
@@ -5411,8 +5536,7 @@ func (t *Task) Validate(ephemeralDisk *EphemeralDisk, jobType string, tgServices
 	}
 
 	// Validation for TaskKind field which is used for Consul Connect integration
-	taskKind := t.Kind
-	if taskKind.IsConnect() {
+	if t.Kind.IsConnectProxy() {
 		// This task is a Connect proxy so it should not have service stanzas
 		if len(t.Services) > 0 {
 			mErr.Errors = append(mErr.Errors, fmt.Errorf("Connect proxy task must not have a service stanza"))
@@ -5420,11 +5544,19 @@ func (t *Task) Validate(ephemeralDisk *EphemeralDisk, jobType string, tgServices
 		if t.Leader {
 			mErr.Errors = append(mErr.Errors, fmt.Errorf("Connect proxy task must not have leader set"))
 		}
-		serviceErr := taskKind.validateProxyService(tgServices)
+		serviceErr := ValidateConnectProxyService(t.Kind.Value(), tgServices)
 		if serviceErr != nil {
 			mErr.Errors = append(mErr.Errors, serviceErr)
 		}
 	}
+
+	// Validation for volumes
+	for idx, vm := range t.VolumeMounts {
+		if !MountPropagationModeIsValid(vm.PropagationMode) {
+			mErr.Errors = append(mErr.Errors, fmt.Errorf("Volume Mount (%d) has an invalid propagation mode: \"%s\"", idx, vm.PropagationMode))
+		}
+	}
+
 	return mErr.ErrorOrNil()
 }
 
@@ -5568,25 +5700,43 @@ func (t *Task) Warnings() error {
 	return mErr.ErrorOrNil()
 }
 
+// TaskKind identifies the special kinds of tasks using the following format:
+// '<kind_name>(:<identifier>)`. The TaskKind can optionally include an identifier that
+// is opague to the Task. This identier can be used to relate the task to some
+// other entity based on the kind.
+//
+// For example, a task may have the TaskKind of `connect-proxy:service` where
+// 'connect-proxy' is the kind name and 'service' is the identifier that relates the
+// task to the service name of which it is a connect proxy for.
 type TaskKind string
 
-const connectPrefix = "connect-proxy:"
-
-func (k TaskKind) IsConnect() bool {
-	return strings.HasPrefix(string(k), connectPrefix) && len(k) > len(connectPrefix)
+// Name returns the kind name portion of the TaskKind
+func (k TaskKind) Name() string {
+	return strings.Split(string(k), ":")[0]
 }
 
-// validateProxyService checks that the service that is being
+// Value returns the identifier of the TaskKind or an empty string if it doesn't
+// include one.
+func (k TaskKind) Value() string {
+	if s := strings.SplitN(string(k), ":", 2); len(s) > 1 {
+		return s[1]
+	}
+	return ""
+}
+
+// IsConnectProxy returns true if the TaskKind is connect-proxy
+func (k TaskKind) IsConnectProxy() bool {
+	return strings.HasPrefix(string(k), ConnectProxyPrefix+":") && len(k) > len(ConnectProxyPrefix)+1
+}
+
+// ConnectProxyPrefix is the prefix used for fields referencing a Consul Connect
+// Proxy
+const ConnectProxyPrefix = "connect-proxy"
+
+// ValidateConnectProxyService checks that the service that is being
 // proxied by this task exists in the task group and contains
 // valid Connect config.
-func (k TaskKind) validateProxyService(tgServices []*Service) error {
-	var mErr multierror.Error
-	parts := strings.Split(string(k), ":")
-	serviceName := strings.Join(parts[1:], "")
-	if len(parts) > 2 {
-		mErr.Errors = append(mErr.Errors, fmt.Errorf("Connect proxy service kind %q must not contain `:`", k))
-	}
-
+func ValidateConnectProxyService(serviceName string, tgServices []*Service) error {
 	found := false
 	for _, svc := range tgServices {
 		if svc.Name == serviceName && svc.Connect != nil && svc.Connect.SidecarService != nil {
@@ -5596,10 +5746,10 @@ func (k TaskKind) validateProxyService(tgServices []*Service) error {
 	}
 
 	if !found {
-		mErr.Errors = append(mErr.Errors, fmt.Errorf("Connect proxy service name not found in services from task group"))
+		return fmt.Errorf("Connect proxy service name not found in services from task group")
 	}
 
-	return mErr.ErrorOrNil()
+	return nil
 }
 
 const (
@@ -8728,12 +8878,17 @@ func (d *DesiredUpdates) GoString() string {
 
 // msgpackHandle is a shared handle for encoding/decoding of structs
 var MsgpackHandle = func() *codec.MsgpackHandle {
-	h := &codec.MsgpackHandle{RawToString: true}
+	h := &codec.MsgpackHandle{}
+	h.RawToString = true
+
+	// maintain binary format from time prior to upgrading latest ugorji
+	h.BasicHandle.TimeNotBuiltin = true
 
 	// Sets the default type for decoding a map into a nil interface{}.
 	// This is necessary in particular because we store the driver configs as a
 	// nil interface{}.
 	h.MapType = reflect.TypeOf(map[string]interface{}(nil))
+
 	return h
 }()
 
@@ -8753,7 +8908,11 @@ var (
 // behind. I feel like its original purpose was to pin at a stable version but
 // now we can accomplish this with vendoring.
 var HashiMsgpackHandle = func() *hcodec.MsgpackHandle {
-	h := &hcodec.MsgpackHandle{RawToString: true}
+	h := &hcodec.MsgpackHandle{}
+	h.RawToString = true
+
+	// maintain binary format from time prior to upgrading latest ugorji
+	h.BasicHandle.TimeNotBuiltin = true
 
 	// Sets the default type for decoding a map into a nil interface{}.
 	// This is necessary in particular because we store the driver configs as a

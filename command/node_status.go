@@ -333,7 +333,7 @@ func formatDrain(n *api.Node) string {
 func (c *NodeStatusCommand) formatNode(client *api.Client, node *api.Node) int {
 	// Format the header output
 	basic := []string{
-		fmt.Sprintf("ID|%s", limit(node.ID, c.length)),
+		fmt.Sprintf("ID|%s", node.ID),
 		fmt.Sprintf("Name|%s", node.Name),
 		fmt.Sprintf("Class|%s", node.NodeClass),
 		fmt.Sprintf("DC|%s", node.Datacenter),
@@ -486,11 +486,11 @@ func (c *NodeStatusCommand) outputNodeVolumeInfo(node *api.Node) {
 	sort.Strings(names)
 
 	output := make([]string, 0, len(names)+1)
-	output = append(output, "Name|ReadOnly|Hidden|Source")
+	output = append(output, "Name|ReadOnly|Source")
 
 	for _, volName := range names {
 		info := node.HostVolumes[volName]
-		output = append(output, fmt.Sprintf("%s|%v|%v|%s", volName, info.ReadOnly, info.Hidden, info.Source))
+		output = append(output, fmt.Sprintf("%s|%v|%s", volName, info.ReadOnly, info.Path))
 	}
 	c.Ui.Output(formatList(output))
 }

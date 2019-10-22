@@ -641,7 +641,7 @@ func ApiJobToStructJob(job *api.Job) *structs.Job {
 	// Update has been pushed into the task groups. stagger and max_parallel are
 	// preserved at the job level, but all other values are discarded. The job.Update
 	// api value is merged into TaskGroups already in api.Canonicalize
-	if job.Update != nil {
+	if job.Update != nil && job.Update.MaxParallel != nil && *job.Update.MaxParallel > 0 {
 		j.Update = structs.UpdateStrategy{}
 
 		if job.Update.Stagger != nil {
@@ -753,8 +753,7 @@ func ApiTgToStructsTG(taskGroup *api.TaskGroup, tg *structs.TaskGroup) {
 				Name:     v.Name,
 				Type:     v.Type,
 				ReadOnly: v.ReadOnly,
-				Hidden:   v.Hidden,
-				Config:   v.Config,
+				Source:   v.Source,
 			}
 
 			tg.Volumes[k] = vol
@@ -813,9 +812,10 @@ func ApiTaskToStructsTask(apiTask *api.Task, structsTask *structs.Task) {
 		structsTask.VolumeMounts = make([]*structs.VolumeMount, l)
 		for i, mount := range apiTask.VolumeMounts {
 			structsTask.VolumeMounts[i] = &structs.VolumeMount{
-				Volume:      mount.Volume,
-				Destination: mount.Destination,
-				ReadOnly:    mount.ReadOnly,
+				Volume:          *mount.Volume,
+				Destination:     *mount.Destination,
+				ReadOnly:        *mount.ReadOnly,
+				PropagationMode: *mount.PropagationMode,
 			}
 		}
 	}
@@ -829,6 +829,7 @@ func ApiTaskToStructsTask(apiTask *api.Task, structsTask *structs.Task) {
 				Tags:        service.Tags,
 				CanaryTags:  service.CanaryTags,
 				AddressMode: service.AddressMode,
+				Meta:        helper.CopyMapStringString(service.Meta),
 			}
 
 			if l := len(service.Checks); l != 0 {
@@ -1006,6 +1007,7 @@ func ApiServicesToStructs(in []*api.Service) []*structs.Service {
 			Tags:        s.Tags,
 			CanaryTags:  s.CanaryTags,
 			AddressMode: s.AddressMode,
+			Meta:        helper.CopyMapStringString(s.Meta),
 		}
 
 		if l := len(s.Checks); l != 0 {
@@ -1028,6 +1030,7 @@ func ApiServicesToStructs(in []*api.Service) []*structs.Service {
 					Method:        check.Method,
 					GRPCService:   check.GRPCService,
 					GRPCUseTLS:    check.GRPCUseTLS,
+					TaskName:      check.TaskName,
 				}
 				if check.CheckRestart != nil {
 					out[i].Checks[j].CheckRestart = &structs.CheckRestart{
@@ -1060,13 +1063,16 @@ func ApiConsulConnectToStructs(in *api.ConsulConnect) *structs.ConsulConnect {
 	if in.SidecarService != nil {
 
 		out.SidecarService = &structs.ConsulSidecarService{
+			Tags: helper.CopySliceString(in.SidecarService.Tags),
 			Port: in.SidecarService.Port,
 		}
 
 		if in.SidecarService.Proxy != nil {
 
 			out.SidecarService.Proxy = &structs.ConsulProxy{
-				Config: in.SidecarService.Proxy.Config,
+				LocalServiceAddress: in.SidecarService.Proxy.LocalServiceAddress,
+				LocalServicePort:    in.SidecarService.Proxy.LocalServicePort,
+				Config:              in.SidecarService.Proxy.Config,
 			}
 
 			upstreams := make([]structs.ConsulUpstream, len(in.SidecarService.Proxy.Upstreams))
@@ -1082,7 +1088,31 @@ func ApiConsulConnectToStructs(in *api.ConsulConnect) *structs.ConsulConnect {
 	}
 
 	if in.SidecarTask != nil {
-		ApiTaskToStructsTask(in.SidecarTask, out.SidecarTask)
+		out.SidecarTask = &structs.SidecarTask{
+			Name:          in.SidecarTask.Name,
+			Driver:        in.SidecarTask.Driver,
+			Config:        in.SidecarTask.Config,
+			User:          in.SidecarTask.User,
+			Env:           in.SidecarTask.Env,
+			Resources:     ApiResourcesToStructs(in.SidecarTask.Resources),
+			Meta:          in.SidecarTask.Meta,
+			LogConfig:     &structs.LogConfig{},
+			ShutdownDelay: in.SidecarTask.ShutdownDelay,
+			KillSignal:    in.SidecarTask.KillSignal,
+		}
+
+		if in.SidecarTask.KillTimeout != nil {
+			out.SidecarTask.KillTimeout = in.SidecarTask.KillTimeout
+		}
+		if in.SidecarTask.LogConfig != nil {
+			out.SidecarTask.LogConfig = &structs.LogConfig{}
+			if in.SidecarTask.LogConfig.MaxFiles != nil {
+				out.SidecarTask.LogConfig.MaxFiles = *in.SidecarTask.LogConfig.MaxFiles
+			}
+			if in.SidecarTask.LogConfig.MaxFileSizeMB != nil {
+				out.SidecarTask.LogConfig.MaxFileSizeMB = *in.SidecarTask.LogConfig.MaxFileSizeMB
+			}
+		}
 	}
 
 	return out
